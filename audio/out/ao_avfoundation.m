@@ -33,7 +33,10 @@
 
 
 @interface AVObserver : NSObject {
+@public
+    // Access the AO only on the renderer queue.
     struct ao *ao;
+    dispatch_queue_t queue;
 }
 - (void)handleRestartNotification:(NSNotification*)notification;
 @end
@@ -45,6 +48,10 @@ struct priv {
     CMAudioFormatDescriptionRef format_description;
     AVObserver *observer;
     int64_t end_time_av;
+    uint64_t request_generation;
+    bool requesting;
+    bool active; // Cleared by reset and EOF, preserved across pause.
+    bool paused;
 };
 
 static int64_t CMTimeGetNanoseconds(CMTime time)
@@ -56,6 +63,15 @@ static int64_t CMTimeGetNanoseconds(CMTime time)
 static CMTime CMTimeFromNanoseconds(int64_t time)
 {
     return CMTimeMake(time, 1000000000);
+}
+
+// All request state and the observer target are accessed on p->queue.
+static void stop_requesting_on_queue(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    p->requesting = false;
+    ++p->request_generation;
+    [p->renderer stopRequestingMediaData];
 }
 
 static void feed(struct ao *ao)
@@ -79,7 +95,8 @@ static void feed(struct ao *ao)
     bool eof;
     int real_sample_count = ao_read_data(ao, data, request_sample_count, end_time_av - cur_time_av + cur_time_mp + time_delta, &eof, false, true);
     if (eof) {
-        [p->renderer stopRequestingMediaData];
+        p->active = false;
+        stop_requesting_on_queue(ao);
         ao_stop_streaming(ao);
     }
     if (real_sample_count == 0) {
@@ -140,37 +157,89 @@ finish:
     if (sample_buffer) CFRelease(sample_buffer);
 }
 
+static void request_on_queue(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    if (!p->active || p->paused || p->requesting)
+        return;
+
+    AVObserver *observer = p->observer;
+    uint64_t generation = ++p->request_generation;
+
+    p->requesting = true;
+    // The retained observer remains valid even after the AO has been freed.
+    [p->renderer requestMediaDataWhenReadyOnQueue:p->queue usingBlock:^{
+        struct ao *target = observer->ao;
+        if (target) {
+            struct priv *current = target->priv;
+            if (current->requesting && current->request_generation == generation)
+                feed(target);
+        }
+    }];
+}
+
+static void start_on_queue(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    p->active = true;
+    p->end_time_av = -1;
+    [p->synchronizer setRate:p->paused ? 0 : 1];
+    request_on_queue(ao);
+}
+
+static void stop_on_queue(struct ao *ao)
+{
+    struct priv *p = ao->priv;
+    p->active = false;
+    p->paused = false;
+    stop_requesting_on_queue(ao);
+    [p->renderer flush];
+    [p->synchronizer setRate:0];
+}
+
 static void start(struct ao *ao)
 {
     struct priv *p = ao->priv;
+    AVObserver *observer = p->observer;
+    dispatch_async(p->queue, ^{
+        struct ao *target = observer->ao;
+        if (!target)
+            return;
 
-    p->end_time_av = -1;
-    [p->synchronizer setRate:1];
-    [p->renderer requestMediaDataWhenReadyOnQueue:p->queue usingBlock:^{
-        feed(ao);
-    }];
+        struct priv *current = target->priv;
+        current->paused = false;
+        start_on_queue(target);
+    });
 }
 
 static void stop(struct ao *ao)
 {
     struct priv *p = ao->priv;
-
     dispatch_sync(p->queue, ^{
-        [p->renderer stopRequestingMediaData];
-        [p->renderer flush];
-        [p->synchronizer setRate:0];
+        stop_on_queue(ao);
     });
 }
 
 static bool set_pause(struct ao *ao, bool paused)
 {
     struct priv *p = ao->priv;
+    AVObserver *observer = p->observer;
+    dispatch_async(p->queue, ^{
+        struct ao *target = observer->ao;
+        if (!target)
+            return;
 
-    if (paused) {
-        [p->synchronizer setRate:0];
-    } else {
-        [p->synchronizer setRate:1];
-    }
+        struct priv *current = target->priv;
+        current->paused = paused;
+        if (paused) {
+            stop_requesting_on_queue(target);
+            [current->synchronizer setRate:0];
+        } else {
+            [current->synchronizer setRate:1];
+            // Resume without discarding buffered audio or its timestamps.
+            request_on_queue(target);
+        }
+    });
 
     return true;
 }
@@ -202,16 +271,34 @@ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
     self = [super init];
     if (self) {
         ao = _ao;
+        queue = ((struct priv *)ao->priv)->queue;
+        dispatch_retain(queue);
     }
     return self;
 }
+- (void)dealloc {
+    dispatch_release(queue);
+    [super dealloc];
+}
 - (void)handleRestartNotification:(NSNotification*)notification {
-    char *name = cfstr_get_cstr((CFStringRef)notification.name);
-    MP_WARN(ao, "restarting due to system notification; this will cause desync\n");
-    MP_VERBOSE(ao, "notification name: %s\n", name);
-    talloc_free(name);
-    stop(ao);
-    start(ao);
+    // A notification already being delivered may outlive removeObserver.
+    dispatch_async(queue, ^{
+        struct ao *target = self->ao;
+        if (!target)
+            return;
+        struct priv *p = target->priv;
+        if (!p->active)
+            return;
+
+        char *name = cfstr_get_cstr((CFStringRef)notification.name);
+        MP_WARN(target, "restarting due to system notification; this will cause desync\n");
+        MP_VERBOSE(target, "notification name: %s\n", name);
+        talloc_free(name);
+        // Preserve pause state while resetting an invalidated output timeline.
+        stop_requesting_on_queue(target);
+        [p->renderer flush];
+        start_on_queue(target);
+    });
 }
 @end
 
@@ -333,14 +420,17 @@ static void uninit(struct ao *ao)
 {
     struct priv *p = ao->priv;
 
-    stop(ao);
+    [[NSNotificationCenter defaultCenter] removeObserver:p->observer];
+    dispatch_sync(p->queue, ^{
+        p->observer->ao = NULL;
+        stop_on_queue(ao);
+    });
 
     [p->renderer release];
     [p->synchronizer release];
     dispatch_release(p->queue);
     CFRelease(p->format_description);
 
-    [[NSNotificationCenter defaultCenter] removeObserver:p->observer];
     [p->observer release];
 
 #if TARGET_OS_IPHONE
